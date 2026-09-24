@@ -1,0 +1,12 @@
+{
+  "cookies": "请粘贴当前已登录智学网请求的 Cookie 头",
+  "openai_compatible": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "填写 API Key",
+    "model": "填写支持图片输入的模型名称",
+    "timeout_seconds": 60
+  },
+  "grading": {
+    "prompt": "填写完整评分 Prompt。程序会强制模型仅输出 JSON 格式 {\"score\": X}。"
+  }
+}

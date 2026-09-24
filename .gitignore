@@ -1,0 +1,31 @@
+# 本地凭据与运行配置，严禁提交
+# 保留 config.example.json，供其他开发者复制后填写。
+config.json*
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+
+# 本地生成的答题卡、日志和导出结果
+answer_cards/
+exports/
+logs/
+*.log
+
+# Python 运行缓存、测试覆盖率与打包产物
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# 本机 IDE 配置
+.idea/
+.vscode/
