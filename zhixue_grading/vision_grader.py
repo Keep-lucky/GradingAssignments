@@ -35,6 +35,47 @@ class VisionGrader:
             raise ValueError("评分 Prompt 不能为空。")
         self._config = replace(self._config, prompt=prompt)
 
+    def generate_grading_prompt(self, template: str, question: str, reference_answer: str) -> str:
+        """根据题型预设、题目和参考答案生成可直接用于评分的 Prompt。"""
+        template = template.strip()
+        question = question.strip()
+        reference_answer = reference_answer.strip()
+        if not template or not question or not reference_answer:
+            raise ValueError("题型预设、题目和参考答案均不能为空。")
+
+        request = f"""你是一名专业的初中语文阅卷规则设计助手。
+请严格参考下方的题型评分 Prompt 模板，并结合题目和参考答案，生成一份可直接交给视觉评分模型使用的完整评分 Prompt。
+
+生成要求：
+1. 保留模板的角色、评分原则和“只输出 JSON：{{\"score\": 整数}}”等安全输出约束。
+2. 将模板中的 {{题目}} 和 {{参考答案}} 替换为给定内容；根据题目和答案补充具体、可执行的评分细则与得分点。
+3. 满分会由评分程序在实际阅卷时附加，因此不要保留 {{满分}} 或 {{评分细则}} 等未替换的占位符；若题目未明确每个得分点的分值，不要虚构固定分值，使用“按满分比例合理分配”等可执行表述。
+4. 只输出生成后的评分 Prompt 正文，不要解释生成过程，不要使用 Markdown 代码块。
+
+【题型预设】
+{template}
+
+【题目】
+{question}
+
+【参考答案】
+{reference_answer}
+"""
+        try:
+            response = self._client.chat.completions.create(
+                model=self._config.model,
+                messages=[{"role": "user", "content": request}],
+                temperature=0,
+                max_tokens=1600,
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+            prompt = (response.choices[0].message.content or "").strip()
+        except (APIConnectionError, APITimeoutError, RateLimitError, APIError, AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("AI 生成批改 Prompt 失败。") from error
+        if not prompt:
+            raise RuntimeError("AI 未返回批改 Prompt。")
+        return prompt
+
     def grade(self, answer_card: AnswerCard) -> int:
         """返回满分范围内的整数建议分；不执行任何平台写入。"""
         if not answer_card.image_urls or answer_card.standard_score is None:

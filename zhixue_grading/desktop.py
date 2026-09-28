@@ -154,14 +154,14 @@ class GradingDesktopApp:
         """打开当前评分 Prompt 的运行时编辑窗口。"""
         self.prompt_window = tk.Toplevel(self.root)
         self.prompt_window.title("编辑评分 Prompt")
-        self.prompt_window.geometry("760x560")
+        self.prompt_window.geometry("760x760")
         self.prompt_window.transient(self.root)
 
         container = ttk.Frame(self.prompt_window, padding=14)
         container.pack(fill=tk.BOTH, expand=True)
         ttk.Label(
             container,
-            text="默认内容来自启动时读取的 config.json；应用后仅影响本次运行中后续的 AI 评分。",
+            text="选择题型预设后，填写题目和参考答案即可由 AI 生成批改 Prompt；生成结果仍可手动修改。应用后仅影响本次运行。",
             wraplength=700,
             justify=tk.LEFT,
         ).pack(anchor=tk.W, pady=(0, 8))
@@ -178,7 +178,20 @@ class GradingDesktopApp:
         )
         self.prompt_template_box.pack(side=tk.LEFT)
         self.prompt_template_box.bind("<<ComboboxSelected>>", self._on_prompt_template_selected)
-        self.prompt_input = tk.Text(container, wrap=tk.WORD, height=24)
+        generation_inputs = ttk.Frame(container)
+        generation_inputs.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(generation_inputs, text="题目：").pack(anchor=tk.W)
+        self.prompt_question_input = tk.Text(generation_inputs, wrap=tk.WORD, height=4)
+        self.prompt_question_input.pack(fill=tk.X, pady=(2, 6))
+        ttk.Label(generation_inputs, text="参考答案：").pack(anchor=tk.W)
+        self.prompt_answer_input = tk.Text(generation_inputs, wrap=tk.WORD, height=4)
+        self.prompt_answer_input.pack(fill=tk.X, pady=(2, 6))
+        self.generate_prompt_button = ttk.Button(
+            generation_inputs, text="AI 生成批改 Prompt", command=self._generate_prompt
+        )
+        self.generate_prompt_button.pack(anchor=tk.E)
+        ttk.Label(container, text="生成的批改 Prompt（可继续编辑）：").pack(anchor=tk.W)
+        self.prompt_input = tk.Text(container, wrap=tk.WORD, height=14)
         self.prompt_input.pack(fill=tk.BOTH, expand=True)
         self._prompt_editor_default = self.grader.prompt
         self.prompt_input.insert("1.0", self._prompt_editor_default)
@@ -197,6 +210,37 @@ class GradingDesktopApp:
             prompt = get_template(selected_name).prompt
         self.prompt_input.delete("1.0", tk.END)
         self.prompt_input.insert("1.0", prompt)
+
+    def _generate_prompt(self) -> None:
+        """使用所选预设和教师输入生成评分 Prompt。"""
+        selected_name = self.prompt_template_var.get()
+        question = self.prompt_question_input.get("1.0", "end-1c").strip()
+        reference_answer = self.prompt_answer_input.get("1.0", "end-1c").strip()
+        if selected_name == self.CURRENT_PROMPT_OPTION:
+            messagebox.showwarning("请选择题型", "请先选择一个题型预设，再生成批改 Prompt。")
+            return
+        if not question or not reference_answer:
+            messagebox.showwarning("信息不完整", "请填写题目和参考答案。")
+            return
+        template = get_template(selected_name).prompt
+        self.generate_prompt_button.configure(state="disabled")
+        self.status_var.set("正在根据题目和参考答案生成批改 Prompt……")
+        self._run(
+            lambda: self.grader.generate_grading_prompt(template, question, reference_answer),
+            self._on_prompt_generated,
+            self._on_prompt_generation_error,
+        )
+
+    def _on_prompt_generated(self, prompt: str) -> None:
+        self.prompt_input.delete("1.0", tk.END)
+        self.prompt_input.insert("1.0", prompt)
+        self.generate_prompt_button.configure(state="normal")
+        self.status_var.set("批改 Prompt 已生成，请确认或编辑后点击“应用”。")
+
+    def _on_prompt_generation_error(self, message: str) -> None:
+        self.generate_prompt_button.configure(state="normal")
+        self.status_var.set("批改 Prompt 生成失败")
+        messagebox.showerror("生成失败", message)
 
     def _save_prompt(self) -> None:
         prompt = self.prompt_input.get("1.0", "end-1c").strip()
@@ -264,13 +308,20 @@ class GradingDesktopApp:
         self.score_var.set("")
         self.info_var.set(f"题号：{card.topic_num_str}    满分：{card.standard_score}    AI 建议：评分中")
         self.status_var.set("正在下载答题卡并启动 AI 评分……")
-        self._run(lambda: self._load_image(card), lambda image: self._on_current_image(card, image))
-        self._run(lambda: self._grade_from_local_image(card), lambda score: self._on_current_score(card, score))
+        # 图片下载完成后复用同一个内存对象来显示和评分，避免同一答卷下载两次。
+        self._run(
+            lambda: self._load_image(card),
+            lambda image: self._on_current_image_loaded(card, image),
+        )
         self._start_preload(card)
 
-    def _on_current_image(self, card: AnswerCard, image: Image.Image) -> None:
+    def _on_current_image_loaded(self, card: AnswerCard, image: Image.Image) -> None:
         if self.current_card and self.current_card.scan_record_id == card.scan_record_id:
             self._show_card_image(image)
+            self._run(
+                lambda: self._grade_from_image(card, image),
+                lambda score: self._on_current_score(card, score),
+            )
 
     def _on_current_score(self, card: AnswerCard, score: int) -> None:
         if self.current_card and self.current_card.scan_record_id == card.scan_record_id:
@@ -295,12 +346,18 @@ class GradingDesktopApp:
         if card is None:
             return
         self.prefetched_card = card
-        self._run(lambda: self._load_image(card), lambda image: self._on_prefetched_image(card, image))
-        self._run(lambda: self._grade_from_local_image(card), lambda score: self._on_prefetched_score(card, score))
+        self._run(
+            lambda: self._load_image(card),
+            lambda image: self._on_prefetched_image_loaded(card, image),
+        )
 
-    def _on_prefetched_image(self, card: AnswerCard, image: Image.Image) -> None:
+    def _on_prefetched_image_loaded(self, card: AnswerCard, image: Image.Image) -> None:
         if self.prefetched_card and self.prefetched_card.scan_record_id == card.scan_record_id:
             self.prefetched_image = image
+            self._run(
+                lambda: self._grade_from_image(card, image),
+                lambda score: self._on_prefetched_score(card, score),
+            )
         if self.current_card and self.current_card.scan_record_id == card.scan_record_id:
             self._show_card_image(image)
 
@@ -326,8 +383,8 @@ class GradingDesktopApp:
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
         return f"data:image/png;base64,{encoded}"
 
-    def _grade_from_local_image(self, card: AnswerCard) -> int:
-        image = self._load_image(card)
+    def _grade_from_image(self, card: AnswerCard, image: Image.Image) -> int:
+        """使用已下载的内存图像评分，不再发起第二次图片下载。"""
         local_card = replace(card, image_urls=(self._image_to_data_url(image),))
         return self.grader.grade(local_card)
 

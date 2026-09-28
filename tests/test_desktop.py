@@ -114,6 +114,34 @@ class DesktopBackgroundTaskTests(unittest.TestCase):
         self.assertTrue(finished.is_set(), "异常信息未被显示")
         self.assertEqual(messages, ["连接失败"])
 
+    def test_current_card_download_is_reused_for_display_and_grading(self) -> None:
+        """同一答卷只下载一次，显示和 AI 评分共享该内存图像。"""
+        app = GradingDesktopApp.__new__(GradingDesktopApp)
+        card = make_card("card-1")
+        image = Image.new("RGB", (2, 2), "white")
+        app.score_var = ValueHolder()
+        app.info_var = ValueHolder()
+        app.status_var = ValueHolder()
+        app._load_image = Mock(return_value=image)
+        app._show_card_image = Mock()
+        app._grade_from_image = Mock(return_value=4)
+        app._on_current_score = Mock()
+        app._start_preload = Mock()
+
+        def run_immediately(function, on_success, _on_error=None):
+            on_success(function())
+
+        app._run = run_immediately
+
+        app._on_card_loaded(card)
+
+        app._load_image.assert_called_once_with(card)
+        app._show_card_image.assert_called_once_with(image)
+        app._grade_from_image.assert_called_once()
+        graded_card, graded_image = app._grade_from_image.call_args.args
+        self.assertIs(graded_card, card)
+        self.assertIs(graded_image, image)
+
 
 class DesktopCookieLoginTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -361,11 +389,11 @@ class DesktopPromptEditorTests(unittest.TestCase):
     def test_open_prompt_editor_populates_text_with_config_loaded_prompt(self) -> None:
         self.app.grader.prompt = "config prompt"
         prompt_window = Mock()
-        prompt_input = Mock()
+        prompt_inputs = [Mock(), Mock(), Mock()]
 
         with (
             patch("zhixue_grading.desktop.tk.Toplevel", return_value=prompt_window),
-            patch("zhixue_grading.desktop.tk.Text", return_value=prompt_input),
+            patch("zhixue_grading.desktop.tk.Text", side_effect=prompt_inputs),
             patch("zhixue_grading.desktop.ttk.Frame"),
             patch("zhixue_grading.desktop.ttk.Label"),
             patch("zhixue_grading.desktop.ttk.Button"),
@@ -374,7 +402,7 @@ class DesktopPromptEditorTests(unittest.TestCase):
         ):
             self.app._open_prompt_editor()
 
-        prompt_input.insert.assert_called_once_with("1.0", "config prompt")
+        prompt_inputs[2].insert.assert_called_once_with("1.0", "config prompt")
 
     def test_save_prompt_applies_trimmed_value_without_writing_config(self) -> None:
         self.app.prompt_input = Mock()
@@ -451,6 +479,42 @@ class DesktopPromptTemplateTests(unittest.TestCase):
             get_template("文言文翻译").prompt + "\n教师补充要求",
         )
         self.assertNotIn("教师补充要求", get_template("文言文翻译").prompt)
+
+
+class DesktopPromptGenerationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app = GradingDesktopApp.__new__(GradingDesktopApp)
+        self.app.grader = Mock()
+        self.app.status_var = ValueHolder()
+        self.app.prompt_template_var = ValueHolder("文言文翻译")
+        self.app.prompt_question_input = EditablePromptInput("翻译下面句子")
+        self.app.prompt_answer_input = EditablePromptInput("把句子翻译成现代汉语")
+        self.app.generate_prompt_button = Mock()
+
+    def test_generate_prompt_uses_selected_template_question_and_reference_answer(self) -> None:
+        captured = {}
+
+        def run(function, on_success, on_error):
+            captured["result"] = function()
+            captured["success"] = on_success
+            captured["error"] = on_error
+
+        self.app._run = run
+        self.app._generate_prompt()
+
+        self.app.grader.generate_grading_prompt.assert_called_once_with(
+            get_template("文言文翻译").prompt, "翻译下面句子", "把句子翻译成现代汉语"
+        )
+        self.assertEqual(self.app.status_var.get(), "正在根据题目和参考答案生成批改 Prompt……")
+
+    def test_generate_prompt_requires_question_and_reference_answer(self) -> None:
+        self.app.prompt_question_input = EditablePromptInput()
+
+        with patch("zhixue_grading.desktop.messagebox.showwarning") as show_warning:
+            self.app._generate_prompt()
+
+        self.app.grader.generate_grading_prompt.assert_not_called()
+        show_warning.assert_called_once_with("信息不完整", "请填写题目和参考答案。")
 
 
 if __name__ == "__main__":
