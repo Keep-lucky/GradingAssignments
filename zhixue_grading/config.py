@@ -18,6 +18,7 @@ class GradingConfig:
     model: str
     prompt: str
     timeout_seconds: int = 60
+    provider: str = "openai"
 
 
 def load_cookie(config_path: Path | None = None) -> str:
@@ -59,9 +60,12 @@ def load_grading_config(config_path: Path | None = None) -> GradingConfig:
             model=str(service["model"]),
             prompt=str(rules["prompt"]),
             timeout_seconds=int(service.get("timeout_seconds", 60)),
+            provider=str(service.get("provider", "openai")).lower(),
         )
     except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise RuntimeError("缺少或无法解析 AI 评分配置，请检查 config.json。") from error
     if not result.api_key:
         raise RuntimeError("缺少 API 密钥。请在 config.json 填写 api_key 或设置 OPENAI_API_KEY。")
+    if result.provider not in {"openai", "anthropic"}:
+        raise RuntimeError("AI provider 仅支持 openai 或 anthropic。")
     return result

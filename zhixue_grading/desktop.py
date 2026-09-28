@@ -12,10 +12,11 @@ from PIL import Image, ImageTk
 
 from .api import MarkingExamClient
 from .card_fetcher import AnswerCard, MarkingTopic
-from .config import load_grading_config
+from .config import GradingConfig, load_grading_config
 from .models import MarkingExam
 from .prompt_templates import get_template, template_labels
-from .vision_grader import VisionGrader
+from .provider_settings import DEFAULT_BASE_URLS, list_models
+from .vision_grader import AnswerRecognition, VisionGrader
 
 
 class GradingDesktopApp:
@@ -40,7 +41,11 @@ class GradingDesktopApp:
         self.current_card: AnswerCard | None = None
         self.prefetched_card: AnswerCard | None = None
         self.prefetched_image: Image.Image | None = None
+        self.prefetched_recognition: AnswerRecognition | None = None
         self.prefetched_score: int | None = None
+        self.current_recognition: AnswerRecognition | None = None
+        self._score_from_edited_transcription = False
+        self.manual_review_var: tk.BooleanVar | None = None
         self.ai_latency: float | None = None
         self.image_ref: ImageTk.PhotoImage | None = None
         self._login_pending = False
@@ -112,6 +117,7 @@ class GradingDesktopApp:
         ttk.Radiobutton(top, text="手动确认", variable=self.grading_mode, value="manual").pack(side=tk.LEFT)
         ttk.Radiobutton(top, text="自动接受 AI", variable=self.grading_mode, value="automatic").pack(side=tk.LEFT)
         ttk.Button(top, text="编辑 Prompt", command=self._open_prompt_editor).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(top, text="AI 设置", command=self._open_ai_settings).pack(side=tk.LEFT, padx=(8, 0))
         self.reviewed_count_var = tk.StringVar(value="已阅题数：0")
         ttk.Label(top, textvariable=self.reviewed_count_var).pack(side=tk.LEFT, padx=(12, 0))
 
@@ -139,6 +145,15 @@ class GradingDesktopApp:
 
         self.image_label = ttk.Label(right, text="选择题号后显示答题卡", anchor=tk.CENTER)
         self.image_label.pack(fill=tk.BOTH, expand=True)
+        transcription_frame = ttk.LabelFrame(right, text="AI 识别的最终作答（可修改后重新评分）", padding=6)
+        transcription_frame.pack(fill=tk.X)
+        self.transcription_input = tk.Text(transcription_frame, height=5, wrap=tk.WORD)
+        self.transcription_input.pack(fill=tk.X)
+        self.recognition_var = tk.StringVar(value="识别状态：等待答题卡")
+        ttk.Label(transcription_frame, textvariable=self.recognition_var).pack(anchor=tk.W, pady=(4, 0))
+        ttk.Button(
+            transcription_frame, text="按当前文本重新评分", command=self._rescore_transcription
+        ).pack(anchor=tk.E, pady=(4, 0))
         bottom = ttk.Frame(right, padding=(0, 8, 0, 0))
         bottom.pack(fill=tk.X)
         self.info_var = tk.StringVar(value="题号：-    满分：-    AI 建议：等待中")
@@ -148,6 +163,12 @@ class GradingDesktopApp:
         self.score_entry = ttk.Entry(bottom, textvariable=self.score_var, width=8)
         self.score_entry.pack(side=tk.LEFT)
         self.score_entry.bind("<Return>", self._submit_score)
+        self.manual_review_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            bottom,
+            text="风险答卷人工复核（仅自动模式）",
+            variable=self.manual_review_var,
+        ).pack(side=tk.LEFT, padx=(10, 0))
         ttk.Button(bottom, text="提交（Enter）", command=self._submit_score).pack(side=tk.LEFT, padx=6)
 
     def _open_prompt_editor(self) -> None:
@@ -200,6 +221,76 @@ class GradingDesktopApp:
         ttk.Button(actions, text="取消", command=self.prompt_window.destroy).pack(side=tk.RIGHT)
         ttk.Button(actions, text="应用", command=self._save_prompt).pack(side=tk.RIGHT, padx=(0, 8))
         self.prompt_input.focus_set()
+
+    def _open_ai_settings(self) -> None:
+        """打开本次运行使用的 AI 服务设置，不将密钥写入磁盘。"""
+        config = self.grader._config
+        self.ai_settings_window = tk.Toplevel(self.root)
+        self.ai_settings_window.title("AI 设置")
+        self.ai_settings_window.geometry("640x300")
+        self.ai_settings_window.transient(self.root)
+        form = ttk.Frame(self.ai_settings_window, padding=16)
+        form.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(form, text="接口类型").grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.ai_provider_var = tk.StringVar(value=config.provider)
+        provider_box = ttk.Combobox(form, textvariable=self.ai_provider_var, values=("openai", "anthropic"), state="readonly", width=18)
+        provider_box.grid(row=0, column=1, sticky=tk.EW, pady=4)
+        provider_box.bind("<<ComboboxSelected>>", self._on_ai_provider_changed)
+        ttk.Label(form, text="请求地址").grid(row=1, column=0, sticky=tk.W, pady=4)
+        self.ai_base_url_var = tk.StringVar(value=config.base_url)
+        ttk.Entry(form, textvariable=self.ai_base_url_var, width=56).grid(row=1, column=1, sticky=tk.EW, pady=4)
+        ttk.Label(form, text="API Key").grid(row=2, column=0, sticky=tk.W, pady=4)
+        self.ai_api_key_var = tk.StringVar(value=config.api_key)
+        ttk.Entry(form, textvariable=self.ai_api_key_var, show="*", width=56).grid(row=2, column=1, sticky=tk.EW, pady=4)
+        ttk.Label(form, text="模型").grid(row=3, column=0, sticky=tk.W, pady=4)
+        self.ai_model_var = tk.StringVar(value=config.model)
+        self.ai_model_box = ttk.Combobox(form, textvariable=self.ai_model_var, state="normal", width=42)
+        self.ai_model_box.grid(row=3, column=1, sticky=tk.EW, pady=4)
+        self.fetch_models_button = ttk.Button(form, text="获取模型", command=self._fetch_models)
+        self.fetch_models_button.grid(row=3, column=2, padx=(8, 0))
+        actions = ttk.Frame(form)
+        actions.grid(row=4, column=1, sticky=tk.E, pady=(14, 0))
+        ttk.Button(actions, text="取消", command=self.ai_settings_window.destroy).pack(side=tk.RIGHT)
+        ttk.Button(actions, text="应用", command=self._apply_ai_settings).pack(side=tk.RIGHT, padx=(0, 8))
+        form.columnconfigure(1, weight=1)
+
+    def _on_ai_provider_changed(self, _event=None) -> None:
+        self.ai_base_url_var.set(DEFAULT_BASE_URLS[self.ai_provider_var.get()])
+        self.ai_model_box["values"] = ()
+
+    def _fetch_models(self) -> None:
+        self.fetch_models_button.configure(state="disabled")
+        self.status_var.set("正在获取可用模型……")
+        self._run(
+            lambda: list_models(self.ai_provider_var.get(), self.ai_base_url_var.get(), self.ai_api_key_var.get()),
+            self._on_models_loaded,
+            self._on_models_load_error,
+        )
+
+    def _on_models_loaded(self, models: list[str]) -> None:
+        self.ai_model_box["values"] = models
+        if self.ai_model_var.get() not in models:
+            self.ai_model_var.set(models[0])
+        self.fetch_models_button.configure(state="normal")
+        self.status_var.set(f"已获取 {len(models)} 个可用模型。")
+
+    def _on_models_load_error(self, message: str) -> None:
+        self.fetch_models_button.configure(state="normal")
+        self.status_var.set("获取模型失败")
+        messagebox.showerror("获取模型失败", message)
+
+    def _apply_ai_settings(self) -> None:
+        provider = self.ai_provider_var.get()
+        base_url = self.ai_base_url_var.get().strip().rstrip("/")
+        api_key = self.ai_api_key_var.get().strip()
+        model = self.ai_model_var.get().strip()
+        if not base_url or not api_key or not model:
+            messagebox.showwarning("设置不完整", "请填写请求地址、API Key 并选择模型。")
+            return
+        old = self.grader._config
+        self.grader = VisionGrader(GradingConfig(base_url, api_key, model, old.prompt, old.timeout_seconds, provider))
+        self.ai_settings_window.destroy()
+        self.status_var.set("AI 设置已应用到本次运行。")
 
     def _on_prompt_template_selected(self, _event=None) -> None:
         """将只读预设复制进编辑框，保留编辑框的后续可修改性。"""
@@ -305,7 +396,11 @@ class GradingDesktopApp:
 
     def _on_card_loaded(self, card: AnswerCard) -> None:
         self.current_card = card
+        self.current_recognition = None
+        self._score_from_edited_transcription = False
         self.score_var.set("")
+        self.transcription_input.delete("1.0", tk.END)
+        self.recognition_var.set("识别状态：正在识别手写作答……")
         self.info_var.set(f"题号：{card.topic_num_str}    满分：{card.standard_score}    AI 建议：评分中")
         self.status_var.set("正在下载答题卡并启动 AI 评分……")
         # 图片下载完成后复用同一个内存对象来显示和评分，避免同一答卷下载两次。
@@ -319,7 +414,16 @@ class GradingDesktopApp:
         if self.current_card and self.current_card.scan_record_id == card.scan_record_id:
             self._show_card_image(image)
             self._run(
-                lambda: self._grade_from_image(card, image),
+                lambda: self._recognize_from_image(card, image),
+                lambda recognition: self._on_current_recognition(card, recognition),
+            )
+
+    def _on_current_recognition(self, card: AnswerCard, recognition: AnswerRecognition) -> None:
+        if self.current_card and self.current_card.scan_record_id == card.scan_record_id:
+            self.current_recognition = recognition
+            self._display_recognition(recognition)
+            self._run(
+                lambda: self.grader.grade_transcription(card, recognition.transcription),
                 lambda score: self._on_current_score(card, score),
             )
 
@@ -334,6 +438,7 @@ class GradingDesktopApp:
         exam = self.selected_exam
         self.prefetched_card = None
         self.prefetched_image = None
+        self.prefetched_recognition = None
         self.prefetched_score = None
         self._run(
             lambda: self.client.preload_next_answer_card(
@@ -355,11 +460,32 @@ class GradingDesktopApp:
         if self.prefetched_card and self.prefetched_card.scan_record_id == card.scan_record_id:
             self.prefetched_image = image
             self._run(
-                lambda: self._grade_from_image(card, image),
-                lambda score: self._on_prefetched_score(card, score),
+                lambda: self._recognize_from_image(card, image),
+                lambda recognition: self._on_prefetched_recognition(card, recognition),
             )
         if self.current_card and self.current_card.scan_record_id == card.scan_record_id:
             self._show_card_image(image)
+
+    def _on_prefetched_recognition(
+        self, card: AnswerCard, recognition: AnswerRecognition
+    ) -> None:
+        is_prefetched = bool(
+            self.prefetched_card
+            and self.prefetched_card.scan_record_id == card.scan_record_id
+        )
+        is_current = bool(
+            self.current_card and self.current_card.scan_record_id == card.scan_record_id
+        )
+        if is_prefetched:
+            self.prefetched_recognition = recognition
+        if is_current:
+            self.current_recognition = recognition
+            self._display_recognition(recognition)
+        if is_prefetched or is_current:
+            self._run(
+                lambda: self.grader.grade_transcription(card, recognition.transcription),
+                lambda score: self._on_prefetched_score(card, score),
+            )
 
     def _on_prefetched_score(self, card: AnswerCard, score: int) -> None:
         if self.prefetched_card and self.prefetched_card.scan_record_id == card.scan_record_id:
@@ -372,7 +498,6 @@ class GradingDesktopApp:
         with urlopen(card.image_urls[0], timeout=30) as response:
             image = Image.open(BytesIO(response.read()))
             image.load()
-        image.thumbnail((820, 620))
         return image
 
     @staticmethod
@@ -383,13 +508,55 @@ class GradingDesktopApp:
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
         return f"data:image/png;base64,{encoded}"
 
-    def _grade_from_image(self, card: AnswerCard, image: Image.Image) -> int:
-        """使用已下载的内存图像评分，不再发起第二次图片下载。"""
+    def _recognize_from_image(self, card: AnswerCard, image: Image.Image) -> AnswerRecognition:
+        """使用已下载的内存图像识别作答，不再发起第二次图片下载。"""
         local_card = replace(card, image_urls=(self._image_to_data_url(image),))
-        return self.grader.grade(local_card)
+        return self.grader.recognize(local_card)
+
+    def _display_recognition(self, recognition: AnswerRecognition) -> None:
+        self.transcription_input.delete("1.0", tk.END)
+        self.transcription_input.insert("1.0", recognition.transcription)
+        if recognition.needs_review:
+            issues = list(recognition.uncertain_spans)
+            if recognition.crossed_out_text:
+                issues.append("存在划除或删改内容")
+            if not recognition.final_answer_clear:
+                issues.append("最终作答不明确")
+            issue_text = "；".join(issues) or "模型要求复核"
+            self.recognition_var.set(f"识别状态：发现风险（{issue_text}）。{recognition.reason}")
+        else:
+            self.recognition_var.set("识别状态：文字清晰，可核对后评分。")
+
+    def _rescore_transcription(self) -> None:
+        if self.current_card is None:
+            return
+        transcription = self.transcription_input.get("1.0", "end-1c").strip()
+        self._score_from_edited_transcription = True
+        self.score_var.set("")
+        self.status_var.set("正在按当前转录文本重新评分……")
+        card = self.current_card
+        self._run(
+            lambda: self.grader.grade_transcription(card, transcription),
+            lambda score: self._on_current_score(card, score),
+        )
+
+    def _manual_review_selected(self) -> bool:
+        """仅在自动模式且教师开启风险复核时阻止自动提交。"""
+        manual_review_var = getattr(self, "manual_review_var", None)
+        recognition = getattr(self, "current_recognition", None)
+        return bool(
+            self.grading_mode.get() == "automatic"
+            and manual_review_var is not None
+            and manual_review_var.get()
+            and recognition
+            and recognition.needs_review
+        )
 
     def _show_card_image(self, image: Image.Image) -> None:
-        self.image_ref = ImageTk.PhotoImage(image)
+        # 给模型保留原始分辨率；界面预览使用副本，避免影响后续识别。
+        preview = image.copy()
+        preview.thumbnail((820, 620))
+        self.image_ref = ImageTk.PhotoImage(preview)
         self.image_label.configure(image=self.image_ref, text="")
         self.status_var.set("答题卡已加载，正在等待 AI 建议分……")
 
@@ -398,9 +565,19 @@ class GradingDesktopApp:
             return
         self.score_var.set(str(score))
         self.info_var.set(f"题号：{self.current_card.topic_num_str}    满分：{self.current_card.standard_score}    AI 建议：{score} 分")
-        if self.grading_mode.get() == "automatic":
+        if (
+            self.grading_mode.get() == "automatic"
+            and self.current_recognition is not None
+            and not self._manual_review_selected()
+            and not self._score_from_edited_transcription
+        ):
             self.status_var.set("自动模式：正在接受 AI 建议并提交……")
             self._submit_score()
+            return
+        if self._manual_review_selected():
+            self.status_var.set("风险答卷已进入人工复核，请核对转录文本和分数后手动提交。")
+            self.score_entry.focus_set()
+            self.score_entry.select_range(0, tk.END)
             return
         self.status_var.set("请核对分数，按 Enter 提交或直接修改")
         self.score_entry.focus_set()
@@ -474,12 +651,19 @@ class GradingDesktopApp:
     def _promote_prefetched_card(self, card: AnswerCard) -> None:
         """平台确认切换后，将已预加载的图片和建议分提升为当前答卷。"""
         self.current_card = card
+        self.current_recognition = self.prefetched_recognition
+        self._score_from_edited_transcription = False
         self.score_var.set("")
         self.info_var.set(f"题号：{card.topic_num_str}    满分：{card.standard_score}    AI 建议：评分中")
         if self.prefetched_image is not None:
             self._show_card_image(self.prefetched_image)
         else:
             self.image_label.configure(image="", text="下一张答题卡图片加载中……")
+        if self.current_recognition is not None:
+            self._display_recognition(self.current_recognition)
+        else:
+            self.transcription_input.delete("1.0", tk.END)
+            self.recognition_var.set("识别状态：正在识别手写作答……")
         if self.prefetched_score is not None:
             self._on_grade_ready(self.prefetched_score)
         else:

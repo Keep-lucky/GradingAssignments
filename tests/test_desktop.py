@@ -16,7 +16,7 @@ from zhixue_grading.card_fetcher import AnswerCard, MarkingTopic
 from zhixue_grading.config import GradingConfig
 from zhixue_grading.desktop import GradingDesktopApp
 from zhixue_grading.prompt_templates import get_template, template_labels
-from zhixue_grading.vision_grader import VisionGrader
+from zhixue_grading.vision_grader import AnswerRecognition, VisionGrader
 
 
 class ImmediateRoot:
@@ -115,17 +115,20 @@ class DesktopBackgroundTaskTests(unittest.TestCase):
         self.assertEqual(messages, ["连接失败"])
 
     def test_current_card_download_is_reused_for_display_and_grading(self) -> None:
-        """同一答卷只下载一次，显示和 AI 评分共享该内存图像。"""
+        """同一答卷只下载一次，显示和 AI 识别共享该内存图像。"""
         app = GradingDesktopApp.__new__(GradingDesktopApp)
         card = make_card("card-1")
         image = Image.new("RGB", (2, 2), "white")
         app.score_var = ValueHolder()
         app.info_var = ValueHolder()
         app.status_var = ValueHolder()
+        app.transcription_input = EditablePromptInput()
+        app.recognition_var = ValueHolder()
+        app.manual_review_var = ValueHolder(False)
         app._load_image = Mock(return_value=image)
         app._show_card_image = Mock()
-        app._grade_from_image = Mock(return_value=4)
-        app._on_current_score = Mock()
+        app._recognize_from_image = Mock()
+        app._on_current_recognition = Mock()
         app._start_preload = Mock()
 
         def run_immediately(function, on_success, _on_error=None):
@@ -137,10 +140,10 @@ class DesktopBackgroundTaskTests(unittest.TestCase):
 
         app._load_image.assert_called_once_with(card)
         app._show_card_image.assert_called_once_with(image)
-        app._grade_from_image.assert_called_once()
-        graded_card, graded_image = app._grade_from_image.call_args.args
-        self.assertIs(graded_card, card)
-        self.assertIs(graded_image, image)
+        app._recognize_from_image.assert_called_once()
+        recognized_card, recognized_image = app._recognize_from_image.call_args.args
+        self.assertIs(recognized_card, card)
+        self.assertIs(recognized_image, image)
 
 
 class DesktopCookieLoginTests(unittest.TestCase):
@@ -309,10 +312,45 @@ class DesktopGradingModeTests(unittest.TestCase):
         self.app.status_var = ValueHolder()
         self.app.score_entry = Mock()
         self.app._submit_score = Mock()
+        self.app.current_recognition = AnswerRecognition("作答", (), (), True, False, "")
+        self.app._score_from_edited_transcription = False
 
         self.app._on_grade_ready(4)
 
         self.assertEqual(self.app.score_var.get(), "4")
+        self.app._submit_score.assert_called_once_with()
+
+    def test_automatic_mode_does_not_submit_when_recognition_needs_review(self) -> None:
+        self.app.current_card = make_card("card-1")
+        self.app.grading_mode = ValueHolder("automatic")
+        self.app.score_var = ValueHolder()
+        self.app.info_var = ValueHolder()
+        self.app.status_var = ValueHolder()
+        self.app.score_entry = Mock()
+        self.app._submit_score = Mock()
+        self.app.manual_review_var = ValueHolder(True)
+        self.app.current_recognition = AnswerRecognition("模糊作答", ("第 2 行",), (), False, True, "字迹模糊")
+        self.app._score_from_edited_transcription = False
+
+        self.app._on_grade_ready(4)
+
+        self.app._submit_score.assert_not_called()
+        self.assertIn("请核对", self.app.status_var.get())
+
+    def test_automatic_mode_submits_risk_answer_when_review_is_disabled(self) -> None:
+        self.app.current_card = make_card("card-1")
+        self.app.grading_mode = ValueHolder("automatic")
+        self.app.manual_review_var = ValueHolder(False)
+        self.app.score_var = ValueHolder()
+        self.app.info_var = ValueHolder()
+        self.app.status_var = ValueHolder()
+        self.app.score_entry = Mock()
+        self.app._submit_score = Mock()
+        self.app.current_recognition = AnswerRecognition("模糊作答", ("第 2 行",), (), False, True, "字迹模糊")
+        self.app._score_from_edited_transcription = False
+
+        self.app._on_grade_ready(4)
+
         self.app._submit_score.assert_called_once_with()
 
     def test_successful_card_transition_updates_reviewed_count_and_topic_row(self) -> None:
@@ -357,18 +395,21 @@ class DesktopLayoutTests(unittest.TestCase):
         left = Mock()
         right = Mock()
         bottom = Mock()
-        string_vars = [ValueHolder(), ValueHolder(), ValueHolder(), ValueHolder(), ValueHolder()]
+        string_vars = [ValueHolder() for _ in range(6)]
 
         with (
             patch("zhixue_grading.desktop.ttk.Frame", side_effect=[toolbar, status_row, left, right, bottom]),
             patch("zhixue_grading.desktop.ttk.PanedWindow", return_value=body),
             patch("zhixue_grading.desktop.ttk.Label") as label,
+            patch("zhixue_grading.desktop.ttk.LabelFrame"),
             patch("zhixue_grading.desktop.ttk.Combobox"),
             patch("zhixue_grading.desktop.ttk.Radiobutton"),
             patch("zhixue_grading.desktop.ttk.Treeview"),
             patch("zhixue_grading.desktop.ttk.Entry"),
             patch("zhixue_grading.desktop.ttk.Button"),
+            patch("zhixue_grading.desktop.tk.Text"),
             patch("zhixue_grading.desktop.tk.StringVar", side_effect=string_vars),
+            patch("zhixue_grading.desktop.tk.BooleanVar", return_value=ValueHolder(False)),
         ):
             app._build_ui()
 
@@ -436,6 +477,26 @@ class VisionGraderPromptTests(unittest.TestCase):
         grader.set_prompt("  revised prompt  ")
 
         self.assertEqual(grader.prompt, "revised prompt")
+
+    def test_recognition_marks_uncertain_text_for_review(self) -> None:
+        recognition = VisionGrader._parse_recognition(
+            '{"transcription":"春眠不觉晓", "uncertain_spans":["晓"], '
+            '"crossed_out_text":[], "final_answer_clear":true, '
+            '"needs_review":false, "reason":"末字笔画不清"}'
+        )
+
+        self.assertTrue(recognition.needs_review)
+        self.assertEqual(recognition.uncertain_spans, ("晓",))
+
+    def test_recognition_marks_crossed_out_text_for_review(self) -> None:
+        recognition = VisionGrader._parse_recognition(
+            '{"transcription":"正确答案", "uncertain_spans":[], '
+            '"crossed_out_text":["原答案"], "final_answer_clear":true, '
+            '"needs_review":false, "reason":""}'
+        )
+
+        self.assertTrue(recognition.needs_review)
+        self.assertEqual(recognition.crossed_out_text, ("原答案",))
 
 
 class PromptTemplateTests(unittest.TestCase):
